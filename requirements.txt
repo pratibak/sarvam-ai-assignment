@@ -1,0 +1,21 @@
+# Core Dependencies
+streamlit==1.31.0
+openai>=1.0.0,<2.0.0
+python-dotenv==1.0.1
+# Data & Database - Using newer version compatible with Python 3.11+
+pandas==2.2.3
+
+# Geospatial
+geopy==2.4.1
+
+# Security
+bcrypt==4.2.1
+
+# Testing (not needed for deployment)
+# pytest==8.0.0
+# pytest-cov==4.1.0
+# pytest-mock==3.12.0
+
+# Code Quality (not needed for deployment)
+# black==24.1.1
+# flake8==7.0.0
