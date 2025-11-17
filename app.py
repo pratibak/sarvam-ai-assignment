@@ -5,8 +5,9 @@ A conversation-first experience for discovering and booking GoodFoods destinatio
 """
 
 import os
+import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -155,6 +156,38 @@ def attach_structured_fields(response: Dict[str, Any], payload: Dict[str, Any]) 
         if key in response:
             payload[key] = response[key]
 
+
+def try_parse_payload(content: Any) -> Optional[Dict[str, Any]]:
+    """
+    Attempt to coerce arbitrary content into a structured dict payload.
+
+    Returns:
+        Dict payload suitable for render_json_response, or None if parsing fails.
+    """
+    if isinstance(content, dict):
+        return content
+
+    if isinstance(content, list):
+        return {"options": content}
+
+    if not isinstance(content, str):
+        return None
+
+    raw = content.strip()
+    if not raw or raw[0] not in "{[":
+        return None
+
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+    if isinstance(parsed, dict):
+        return parsed
+    if isinstance(parsed, list):
+        return {"options": parsed}
+    return None
+
 # ---------------------------------------------------------------------------
 # Session helpers
 # ---------------------------------------------------------------------------
@@ -179,6 +212,7 @@ def init_session_state() -> None:
         "orchestrator": None,
         "quick_command": None,
         "pending_prompt": None,
+        "show_debug_json": False,
     }
 
     for key, value in defaults.items():
@@ -445,6 +479,7 @@ def render_concierge_tab() -> None:
             for key in keys:
                 del st.session_state[key]
             st.experimental_rerun()
+        st.checkbox("Debug output", key="show_debug_json")
 
     st.divider()
 
@@ -456,9 +491,17 @@ def render_concierge_tab() -> None:
 
     process_quick_command()
 
-    for message in st.session_state.messages:
+    debug_enabled = st.session_state.get("show_debug_json", False)
+
+    for idx, message in enumerate(st.session_state.messages):
         with st.chat_message(message["role"]):
             payload = message.get("json")
+            if not payload:
+                parsed_payload = try_parse_payload(message.get("content"))
+                if parsed_payload:
+                    payload = parsed_payload
+                    st.session_state.messages[idx]["json"] = parsed_payload
+
             if payload:
                 render_json_response(payload)
             else:
@@ -473,6 +516,19 @@ def render_concierge_tab() -> None:
             if message.get("reservation"):
                 render_payment_prompt(message)
 
+            if debug_enabled:
+                debug_payload = {}
+                if payload:
+                    debug_payload = payload
+                else:
+                    for key in STRUCTURED_RESPONSE_KEYS:
+                        if key in message:
+                            debug_payload[key] = message[key]
+
+                if debug_payload:
+                    with st.expander("Debug payload", expanded=False):
+                        st.json(debug_payload)
+
     process_pending_prompt()
 
     if user_prompt := st.chat_input("Type your request..."):
@@ -486,10 +542,14 @@ def render_concierge_tab() -> None:
                 try:
                     response = orchestrator.process_message(user_prompt)
 
+                    payload_json = response.get("json")
+                    if not payload_json:
+                        payload_json = try_parse_payload(response.get("text"))
+
                     summary_text = None
-                    if response.get("json"):
-                        summary_text = response["json"].get("summary")
-                        render_json_response(response["json"])
+                    if payload_json:
+                        summary_text = payload_json.get("summary")
+                        render_json_response(payload_json)
                     else:
                         st.markdown(response["text"])
 
@@ -498,13 +558,23 @@ def render_concierge_tab() -> None:
                         "content": summary_text or response["text"]
                     }
 
-                    if response.get("json"):
-                        response_payload["json"] = response["json"]
+                    if payload_json:
+                        response_payload["json"] = payload_json
 
                     if "restaurants" in response:
                         show_restaurant_cards(response["restaurants"])
                     if "bookings" in response:
                         display_booking_cards(response["bookings"])
+
+                    if debug_enabled:
+                        debug_payload = payload_json or {}
+                        if not debug_payload:
+                            for key in STRUCTURED_RESPONSE_KEYS:
+                                if key in response:
+                                    debug_payload[key] = response[key]
+                        if debug_payload:
+                            with st.expander("Debug payload", expanded=False):
+                                st.json(debug_payload)
 
                     attach_structured_fields(response, response_payload)
 
@@ -605,6 +675,8 @@ def render_json_response(payload: Dict[str, Any]) -> None:
     # Auto-build options from tool output if model omitted them
     options = payload.get("options")
     restaurants = payload.get("restaurants")
+    itinerary_segments = payload.get("itinerary") or payload.get("journey") or []
+
     if (not options or len(options) == 0) and restaurants:
         generated_options = []
         for restaurant in restaurants[:5]:
@@ -638,6 +710,66 @@ def render_json_response(payload: Dict[str, Any]) -> None:
             )
         payload["options"] = generated_options
 
+    options = payload.get("options")
+    if (not options or len(options) == 0) and itinerary_segments:
+        generated_options = []
+        seen_titles = set()
+        for segment in itinerary_segments:
+            stage = (
+                segment.get("stage")
+                or segment.get("slot")
+                or segment.get("title")
+                or segment.get("label")
+            )
+            segment_attributes = segment.get("attributes") or []
+            stage_summary = segment.get("summary") or segment.get("details")
+            venues = (
+                segment.get("options")
+                or segment.get("venues")
+                or segment.get("stops")
+                or segment.get("destinations")
+            )
+
+            # If the segment itself carries venue info, treat it as a single option
+            if not venues:
+                venues = [segment]
+
+            for venue in venues:
+                title = venue.get("title") or venue.get("name")
+                if not title or title in seen_titles:
+                    continue
+
+                subtitle = venue.get("subtitle") or venue.get("cuisine")
+                details = (
+                    venue.get("details")
+                    or venue.get("summary")
+                    or stage_summary
+                    or "Curated for this itinerary step."
+                )
+
+                distance = venue.get("distance_km")
+                venue_attributes = venue.get("attributes") or venue.get("highlights") or []
+
+                combined_attributes = []
+                if stage and stage not in combined_attributes:
+                    combined_attributes.append(stage)
+                combined_attributes.extend(attr for attr in segment_attributes if attr not in combined_attributes)
+                combined_attributes.extend(attr for attr in venue_attributes if attr not in combined_attributes)
+
+                generated_options.append(
+                    {
+                        "title": title,
+                        "subtitle": subtitle,
+                        "distance_km": distance,
+                        "details": details,
+                        "attributes": combined_attributes,
+                    }
+                )
+                seen_titles.add(title)
+
+        if generated_options:
+            payload["options"] = generated_options
+
     summary = payload.get("summary")
     if summary:
         st.markdown(f"**{summary}**")
@@ -668,6 +800,44 @@ def render_json_response(payload: Dict[str, Any]) -> None:
     next_steps = payload.get("next_steps")
     if next_steps:
         st.markdown(f"_Next:_ {next_steps}")
+
+    if itinerary_segments:
+        st.markdown("**Suggested itinerary**")
+        for segment in itinerary_segments:
+            stage = (
+                segment.get("stage")
+                or segment.get("slot")
+                or segment.get("title")
+                or segment.get("label")
+                or "Experience"
+            )
+            stage_summary = segment.get("summary") or segment.get("details")
+            st.markdown(f"**{stage}**")
+            if stage_summary:
+                st.markdown(stage_summary)
+
+            venues = (
+                segment.get("options")
+                or segment.get("venues")
+                or segment.get("stops")
+                or segment.get("destinations")
+            ) or []
+
+            for venue in venues:
+                name = venue.get("title") or venue.get("name")
+                if not name:
+                    continue
+                subtitle = venue.get("subtitle") or venue.get("cuisine")
+                description = venue.get("details") or venue.get("summary")
+                attributes = venue.get("attributes") or venue.get("highlights") or []
+                line = f"- {name}"
+                if subtitle:
+                    line += f" · _{subtitle}_"
+                if description:
+                    line += f": {description}"
+                st.markdown(line)
+                if attributes:
+                    st.caption(" · ".join(attributes))
 
     fee = payload.get("reservation_fee")
     if fee is not None:
